@@ -3,7 +3,16 @@ const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
+
+const PRICE_MAP = {
+    plus_monthly: 'price_1SYstEIUreX0PzJ7Mtkd04LM', // Basic monthly $9.99
+    plus_yearly: 'price_1SYstEIUreX0PzJ7ME1DVoXg',  // Basic yearly ~$107
+    pro_monthly: 'price_1SYsu9IUreX0PzJ7KM8Zw1Uj',  // Better monthly $19.99
+    pro_yearly: 'price_1SYsufIUreX0PzJ7XCKOf5hC',   // Better yearly (~$215?) - confirm
+    business_monthly: 'price_1SYsvyIUreX0PzJ7gfKogBNR', // Best monthly $29.99
+    business_yearly: 'price_1SYsvyIUreX0PzJ7Kjfkns1k',  // Best yearly ~$334
+};
 
 // Middleware
 app.use(cors());
@@ -44,6 +53,53 @@ app.post('/create-payment-intent', async (req, res) => {
     } catch (error) {
         console.error('Error creating payment intent:', error);
         res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/create-subscription', async (req, res) => {
+    try {
+        const { email, name, planId, billingCycle } = req.body;
+
+        if (!email) {
+            return res.status(400).json({ error: 'Email required' });
+        }
+
+        const priceId = PRICE_MAP[`${planId}_${billingCycle}`];
+        if (!priceId) {
+            return res.status(400).json({ error: 'Invalid plan' });
+        }
+
+        let customerId;
+        const existing = await stripe.customers.list({ email, limit: 1 });
+        if (existing.data.length) {
+            customerId = existing.data[0].id;
+        } else {
+            const customer = await stripe.customers.create({ email, name });
+            customerId = customer.id;
+        }
+
+        const subscription = await stripe.subscriptions.create({
+            customer: customerId,
+            items: [{ price: priceId }],
+            payment_behavior: 'default_incomplete',
+            expand: ['latest_invoice.payment_intent'],
+        });
+
+        const paymentIntent = subscription.latest_invoice.payment_intent;
+        const ephemeralKey = await stripe.ephemeralKeys.create(
+            { customer: customerId },
+            { apiVersion: '2024-06-20' }
+        );
+
+        return res.json({
+            subscriptionId: subscription.id,
+            customerId,
+            paymentIntentClientSecret: paymentIntent.client_secret,
+            ephemeralKeySecret: ephemeralKey.secret,
+        });
+    } catch (err) {
+        console.error('Create subscription error:', err);
+        res.status(500).json({ error: err.message });
     }
 });
 
