@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
+const OpenAI = require('openai');
 
 const app = express();
 const STRIPE_MODE = (process.env.STRIPE_MODE || 'test').toLowerCase();
@@ -16,6 +17,10 @@ const STRIPE_WEBHOOK_SECRET =
 if (!STRIPE_SECRET_KEY) {
     throw new Error('Stripe secret key not configured');
 }
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const openaiClient = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
 const stripe = require('stripe')(STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
 
@@ -39,6 +44,71 @@ app.get('/', (req, res) => {
 
 app.get('/health', (_req, res) => {
     res.json({ ok: true });
+});
+
+const fallbackAiResponse = (metadata = {}, preferredFolders = []) => ({
+    title: metadata.title || 'Content',
+    description: metadata.description || 'Description',
+    tags: metadata.tags || ['tag1', 'tag2'],
+    suggestedFolders: Array.isArray(preferredFolders) && preferredFolders.length ? preferredFolders : ['General'],
+    category: 'General',
+});
+
+app.post('/ai/analyze', async (req, res) => {
+    const { type = 'url', url, metadata = {}, imageBase64, preferredFolders = [] } = req.body || {};
+
+    try {
+        if (!openaiClient) {
+            return res.json(fallbackAiResponse(metadata, preferredFolders));
+        }
+
+        const foldersList = Array.isArray(preferredFolders) ? preferredFolders.join(', ') : '';
+        const userText = [
+            `Type: ${type}`,
+            url ? `URL: ${url}` : null,
+            metadata?.title ? `Title: ${metadata.title}` : null,
+            metadata?.description ? `Description: ${metadata.description}` : null,
+            metadata?.keywords ? `Keywords: ${metadata.keywords}` : null,
+            foldersList ? `Preferred folders: ${foldersList}` : null,
+        ]
+            .filter(Boolean)
+            .join('\n');
+
+        const messages = [
+            {
+                role: 'system',
+                content:
+                    'You categorize and tag user-provided content. Respond ONLY with JSON containing: ' +
+                    'title (string), description (string), tags (array of short strings), ' +
+                    'suggestedFolders (array of short strings), category (short string). ' +
+                    'Keep it concise and safe for general audiences.',
+            },
+            {
+                role: 'user',
+                content: [
+                    { type: 'text', text: userText || 'Analyze this content.' },
+                    ...(imageBase64
+                        ? [{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } }]
+                        : []),
+                ],
+            },
+        ];
+
+        const completion = await openaiClient.chat.completions.create({
+            model: OPENAI_MODEL,
+            temperature: 0.4,
+            response_format: { type: 'json_object' },
+            messages,
+        });
+
+        const raw = completion?.choices?.[0]?.message?.content;
+        const parsed = raw ? JSON.parse(raw) : null;
+
+        return res.json(parsed || fallbackAiResponse(metadata, preferredFolders));
+    } catch (err) {
+        console.error('AI analyze error:', err);
+        return res.status(500).json({ error: 'AI analysis failed', fallback: fallbackAiResponse(metadata, preferredFolders) });
+    }
 });
 
 // Create payment intent
