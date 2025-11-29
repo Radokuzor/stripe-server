@@ -3,7 +3,21 @@ const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
+const STRIPE_MODE = (process.env.STRIPE_MODE || 'test').toLowerCase();
+const STRIPE_SECRET_KEY =
+    STRIPE_MODE === 'live'
+        ? process.env.STRIPE_SECRET_KEY_LIVE || process.env.STRIPE_SECRET_KEY
+        : process.env.STRIPE_SECRET_KEY_TEST || process.env.STRIPE_SECRET_KEY;
+const STRIPE_WEBHOOK_SECRET =
+    STRIPE_MODE === 'live'
+        ? process.env.STRIPE_WEBHOOK_SECRET_LIVE || process.env.STRIPE_WEBHOOK_SECRET
+        : process.env.STRIPE_WEBHOOK_SECRET_TEST || process.env.STRIPE_WEBHOOK_SECRET;
+
+if (!STRIPE_SECRET_KEY) {
+    throw new Error('Stripe secret key not configured');
+}
+
+const stripe = require('stripe')(STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
 
 const PRICE_MAP = {
     plus_monthly: 'price_1SYstEIUreX0PzJ7Mtkd04LM', // Basic monthly $9.99
@@ -144,7 +158,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         event = stripe.webhooks.constructEvent(
             req.body,
             sig,
-            process.env.STRIPE_WEBHOOK_SECRET
+            STRIPE_WEBHOOK_SECRET
         );
     } catch (err) {
         console.error('Webhook signature verification failed:', err.message);
