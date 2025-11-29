@@ -14,6 +14,10 @@ app.get('/', (req, res) => {
     res.json({ status: 'Server is running' });
 });
 
+app.get('/health', (_req, res) => {
+    res.json({ ok: true });
+});
+
 // Create payment intent
 app.post('/create-payment-intent', async (req, res) => {
     try {
@@ -110,7 +114,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     res.json({ received: true });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
