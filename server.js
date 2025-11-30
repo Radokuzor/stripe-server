@@ -110,6 +110,7 @@ app.post('/ai/analyze', async (req, res) => {
                 ? [{ type: 'input_image', image_url: `data:image/jpeg;base64,${imageBase64}` }]
                 : []),
         ];
+        console.log('AI analyze prompt to model:', { basePrompt, userContent });
 
         let raw;
 
