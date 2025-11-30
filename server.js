@@ -103,14 +103,6 @@ app.post('/ai/analyze', async (req, res) => {
             .filter(Boolean)
             .join('\n');
 
-        const userContent = [
-            { type: 'text', text: userText || 'Analyze this content.' },
-            ...(imageBase64
-                ? [{ type: 'input_image', image_url: `data:image/jpeg;base64,${imageBase64}` }]
-                : []),
-        ];
-        console.log('AI analyze prompt to model:', { userContent });
-
         let raw;
 
         if (OPENAI_ASSISTANT_ID) {
@@ -119,10 +111,20 @@ app.post('/ai/analyze', async (req, res) => {
             // Create a thread
             const thread = await openaiClient.beta.threads.create();
 
-            // Add message to thread
+            // Add message to thread - Assistants API format
+            const messageContent = imageBase64
+                ? [
+                    { type: 'text', text: userText || 'Analyze this content.' },
+                    {
+                        type: 'image_url',
+                        image_url: { url: `data:image/jpeg;base64,${imageBase64}` }
+                    }
+                ]
+                : userText || 'Analyze this content.';
+
             await openaiClient.beta.threads.messages.create(thread.id, {
                 role: 'user',
-                content: userContent
+                content: messageContent
             });
 
             // Run the assistant
