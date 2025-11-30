@@ -20,6 +20,7 @@ if (!STRIPE_SECRET_KEY) {
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const OPENAI_ASSISTANT_ID = process.env.OPENAI_ASSISTANT_ID;
 const openaiClient = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
 const stripe = require('stripe')(STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
@@ -46,13 +47,21 @@ app.get('/health', (_req, res) => {
     res.json({ ok: true });
 });
 
-const fallbackAiResponse = (metadata = {}, preferredFolders = []) => ({
-    title: metadata.title || 'Content',
-    description: metadata.description || 'Description',
-    tags: metadata.tags || ['tag1', 'tag2'],
-    suggestedFolders: Array.isArray(preferredFolders) && preferredFolders.length ? preferredFolders : ['General'],
-    category: 'General',
-});
+const fallbackAiResponse = (metadata = {}, preferredFolders = []) => {
+    const cleanFolders = (Array.isArray(preferredFolders) ? preferredFolders : [])
+        .map((f) => (f || '').trim())
+        .filter(Boolean);
+
+    const suggestedFolders = cleanFolders.length ? [cleanFolders[0]] : ['General'];
+
+    return {
+        title: metadata.title || 'Content',
+        description: metadata.description || 'Description',
+        tags: metadata.tags || ['tag1', 'tag2'],
+        suggestedFolders,
+        category: suggestedFolders[0] || 'General',
+    };
+};
 
 app.post('/ai/analyze', async (req, res) => {
     const { type = 'url', url, metadata = {}, imageBase64, preferredFolders = [] } = req.body || {};
@@ -62,50 +71,84 @@ app.post('/ai/analyze', async (req, res) => {
             return res.json(fallbackAiResponse(metadata, preferredFolders));
         }
 
-        const foldersList = Array.isArray(preferredFolders) ? preferredFolders.join(', ') : '';
+        const cleanFolders = (Array.isArray(preferredFolders) ? preferredFolders : [])
+            .map((f) => (f || '').trim())
+            .filter(Boolean);
+        const foldersList = cleanFolders.join(', ');
         const userText = [
             `Type: ${type}`,
             url ? `URL: ${url}` : null,
             metadata?.title ? `Title: ${metadata.title}` : null,
             metadata?.description ? `Description: ${metadata.description}` : null,
             metadata?.keywords ? `Keywords: ${metadata.keywords}` : null,
-            foldersList ? `Preferred folders: ${foldersList}` : null,
+            foldersList ? `Existing folders: ${foldersList}` : null,
         ]
             .filter(Boolean)
             .join('\n');
 
-        const messages = [
-            {
-                role: 'system',
-                content:
-                    'You categorize and tag user content. Respond ONLY with JSON containing: ' +
-                    'title (specific, rewritten; do not just shorten), description (2-3 sentences, ' +
-                    'expand using available metadata; fill gaps with reasonable, safe context), ' +
-                    'tags (array of short strings), suggestedFolders (array of short strings), ' +
-                    'category (short string). Avoid placeholders. Keep safe for general audiences.',
-            },
-            {
-                role: 'user',
-                content: [
-                    { type: 'text', text: userText || 'Analyze this content.' },
-                    ...(imageBase64
-                        ? [{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } }]
-                        : []),
-                ],
-            },
+        const basePrompt =
+            'You categorize and tag user content. Respond ONLY with JSON containing: ' +
+            'title (7-12 words, specific, rewritten; do not just shorten), ' +
+            'description (2-3 sentences; expand with key entities/keywords for search), ' +
+            'tags (3-8 short keyword strings), suggestedFolders (single-word strings, lowercase or snake_case; ' +
+            'reuse the closest match from provided folders; only create a new one if none clearly fit), ' +
+            'category (one word; the single most specific concept, prefer an existing folder if relevant). ' +
+            'Avoid placeholders. Keep safe for general audiences.';
+
+        const userContent = [
+            { type: 'text', text: userText || 'Analyze this content.' },
+            ...(imageBase64
+                ? [{ type: 'input_image', image_url: `data:image/jpeg;base64,${imageBase64}` }]
+                : []),
         ];
 
-        const completion = await openaiClient.chat.completions.create({
-            model: OPENAI_MODEL,
-            temperature: 0.4,
-            response_format: { type: 'json_object' },
-            messages,
-        });
+        let raw;
 
-        const raw = completion?.choices?.[0]?.message?.content;
+        if (OPENAI_ASSISTANT_ID) {
+            const response = await openaiClient.responses.create({
+                assistant_id: OPENAI_ASSISTANT_ID,
+                input: [{ role: 'user', content: userContent }],
+                response_format: { type: 'json_object' },
+                temperature: 0.3,
+                extra_body: {
+                    system: basePrompt,
+                },
+            });
+            raw =
+                response?.output_text ||
+                response?.output?.[0]?.content?.[0]?.text ||
+                response?.output?.[0]?.content?.[0]?.text?.value ||
+                '';
+        } else {
+            const messages = [
+                {
+                    role: 'system',
+                    content: basePrompt,
+                },
+                {
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: userText || 'Analyze this content.' },
+                        ...(imageBase64
+                            ? [{ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } }]
+                            : []),
+                    ],
+                },
+            ];
+
+            const completion = await openaiClient.chat.completions.create({
+                model: OPENAI_MODEL,
+                temperature: 0.3,
+                response_format: { type: 'json_object' },
+                messages,
+            });
+
+            raw = completion?.choices?.[0]?.message?.content;
+        }
+
         const parsed = raw ? JSON.parse(raw) : null;
 
-        return res.json(parsed || fallbackAiResponse(metadata, preferredFolders));
+        return res.json(parsed || fallbackAiResponse(metadata, cleanFolders));
     } catch (err) {
         console.error('AI analyze error:', err);
         return res.status(500).json({ error: 'AI analysis failed', fallback: fallbackAiResponse(metadata, preferredFolders) });
