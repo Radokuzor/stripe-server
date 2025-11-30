@@ -115,18 +115,36 @@ app.post('/ai/analyze', async (req, res) => {
 
         if (OPENAI_ASSISTANT_ID) {
             console.log('AI analyze using assistant:', OPENAI_ASSISTANT_ID);
-            const response = await openaiClient.responses.create({
-                model: OPENAI_MODEL,
-                assistant_id: OPENAI_ASSISTANT_ID,
-                input: [{ role: 'user', content: userContent }],
-                temperature: 0.3,
-                text: { format: 'json_object' },
+
+            // Create a thread
+            const thread = await openaiClient.beta.threads.create();
+
+            // Add message to thread
+            await openaiClient.beta.threads.messages.create(thread.id, {
+                role: 'user',
+                content: userContent
             });
-            raw =
-                response?.output_text ||
-                response?.output?.[0]?.content?.[0]?.text ||
-                response?.output?.[0]?.content?.[0]?.text?.value ||
-                '';
+
+            // Run the assistant
+            const run = await openaiClient.beta.threads.runs.create(thread.id, {
+                assistant_id: OPENAI_ASSISTANT_ID,
+            });
+
+            // Wait for completion
+            let runStatus = await openaiClient.beta.threads.runs.retrieve(thread.id, run.id);
+            while (runStatus.status !== 'completed') {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                runStatus = await openaiClient.beta.threads.runs.retrieve(thread.id, run.id);
+
+                if (runStatus.status === 'failed' || runStatus.status === 'cancelled') {
+                    throw new Error(`Run ${runStatus.status}`);
+                }
+            }
+
+            // Get messages
+            const messages = await openaiClient.beta.threads.messages.list(thread.id);
+            raw = messages.data[0].content[0].text.value;
+
             console.log('AI analyze assistant raw output:', raw);
         } else {
             const basePrompt =
