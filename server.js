@@ -118,8 +118,8 @@ app.post('/ai/analyze', async (req, res) => {
             const response = await openaiClient.responses.create({
                 assistant_id: OPENAI_ASSISTANT_ID,
                 input: [{ role: 'user', content: userContent }],
-                response_format: { type: 'json_object' },
                 temperature: 0.3,
+                text: { format: 'json_object' },
             });
             raw =
                 response?.output_text ||
