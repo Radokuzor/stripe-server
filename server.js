@@ -116,6 +116,7 @@ app.post('/ai/analyze', async (req, res) => {
         if (OPENAI_ASSISTANT_ID) {
             console.log('AI analyze using assistant:', OPENAI_ASSISTANT_ID);
             const response = await openaiClient.responses.create({
+                model: OPENAI_MODEL,
                 assistant_id: OPENAI_ASSISTANT_ID,
                 input: [{ role: 'user', content: userContent }],
                 temperature: 0.3,
