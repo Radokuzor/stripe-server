@@ -75,6 +75,15 @@ app.post('/ai/analyze', async (req, res) => {
             .map((f) => (f || '').trim())
             .filter(Boolean);
         const foldersList = cleanFolders.join(', ');
+        console.log('AI analyze incoming:', {
+            type,
+            url,
+            metadata,
+            preferredFolders: cleanFolders,
+            hasImage: Boolean(imageBase64),
+            assistant: OPENAI_ASSISTANT_ID || null,
+        });
+
         const userText = [
             `Type: ${type}`,
             url ? `URL: ${url}` : null,
@@ -105,6 +114,7 @@ app.post('/ai/analyze', async (req, res) => {
         let raw;
 
         if (OPENAI_ASSISTANT_ID) {
+            console.log('AI analyze using assistant:', OPENAI_ASSISTANT_ID);
             const response = await openaiClient.responses.create({
                 assistant_id: OPENAI_ASSISTANT_ID,
                 input: [{ role: 'user', content: userContent }],
@@ -119,6 +129,7 @@ app.post('/ai/analyze', async (req, res) => {
                 response?.output?.[0]?.content?.[0]?.text ||
                 response?.output?.[0]?.content?.[0]?.text?.value ||
                 '';
+            console.log('AI analyze assistant raw output:', raw);
         } else {
             const messages = [
                 {
@@ -144,9 +155,11 @@ app.post('/ai/analyze', async (req, res) => {
             });
 
             raw = completion?.choices?.[0]?.message?.content;
+            console.log('AI analyze chat raw output:', raw);
         }
 
         const parsed = raw ? JSON.parse(raw) : null;
+        console.log('AI analyze parsed JSON:', parsed);
 
         return res.json(parsed || fallbackAiResponse(metadata, cleanFolders));
     } catch (err) {
