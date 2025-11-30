@@ -47,8 +47,8 @@ app.get('/health', (_req, res) => {
     res.json({ ok: true });
 });
 
-const fallbackAiResponse = (metadata = {}, preferredFolders = []) => {
-    const cleanFolders = (Array.isArray(preferredFolders) ? preferredFolders : [])
+const fallbackAiResponse = (metadata = {}, folders = []) => {
+    const cleanFolders = (Array.isArray(folders) ? folders : [])
         .map((f) => (f || '').trim())
         .filter(Boolean);
 
@@ -64,14 +64,22 @@ const fallbackAiResponse = (metadata = {}, preferredFolders = []) => {
 };
 
 app.post('/ai/analyze', async (req, res) => {
-    const { type = 'url', url, metadata = {}, imageBase64, preferredFolders = [] } = req.body || {};
+    const {
+        type = 'url',
+        url,
+        metadata = {},
+        imageBase64,
+        currentFolders,
+        preferredFolders,
+    } = req.body || {};
 
     try {
         if (!openaiClient) {
-            return res.json(fallbackAiResponse(metadata, preferredFolders));
+            return res.json(fallbackAiResponse(metadata, currentFolders || preferredFolders || []));
         }
 
-        const cleanFolders = (Array.isArray(preferredFolders) ? preferredFolders : [])
+        const incomingFolders = currentFolders ?? preferredFolders ?? [];
+        const cleanFolders = (Array.isArray(incomingFolders) ? incomingFolders : [])
             .map((f) => (f || '').trim())
             .filter(Boolean);
         const foldersList = cleanFolders.join(', ');
@@ -79,7 +87,7 @@ app.post('/ai/analyze', async (req, res) => {
             type,
             url,
             metadata,
-            preferredFolders: cleanFolders,
+            currentFolders: cleanFolders,
             hasImage: Boolean(imageBase64),
             assistant: OPENAI_ASSISTANT_ID || null,
         });
@@ -162,7 +170,7 @@ app.post('/ai/analyze', async (req, res) => {
         return res.json(parsed || fallbackAiResponse(metadata, cleanFolders));
     } catch (err) {
         console.error('AI analyze error:', err);
-        return res.status(500).json({ error: 'AI analysis failed', fallback: fallbackAiResponse(metadata, preferredFolders) });
+        return res.status(500).json({ error: 'AI analysis failed', fallback: fallbackAiResponse(metadata, currentFolders || preferredFolders || []) });
     }
 });
 
