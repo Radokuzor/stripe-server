@@ -78,10 +78,11 @@ app.post('/ai/analyze', async (req, res) => {
             {
                 role: 'system',
                 content:
-                    'You categorize and tag user-provided content. Respond ONLY with JSON containing: ' +
-                    'title (string), description (string), tags (array of short strings), ' +
-                    'suggestedFolders (array of short strings), category (short string). ' +
-                    'Keep it concise and safe for general audiences.',
+                    'You categorize and tag user content. Respond ONLY with JSON containing: ' +
+                    'title (specific, rewritten; do not just shorten), description (2-3 sentences, ' +
+                    'expand using available metadata; fill gaps with reasonable, safe context), ' +
+                    'tags (array of short strings), suggestedFolders (array of short strings), ' +
+                    'category (short string). Avoid placeholders. Keep safe for general audiences.',
             },
             {
                 role: 'user',
