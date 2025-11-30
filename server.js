@@ -25,14 +25,24 @@ const openaiClient = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : n
 
 const stripe = require('stripe')(STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
 
-const PRICE_MAP = {
-    plus_monthly: 'price_1SYstEIUreX0PzJ7Mtkd04LM', // Basic monthly $9.99
-    plus_yearly: 'price_1SYstEIUreX0PzJ7ME1DVoXg',  // Basic yearly ~$107
-    pro_monthly: 'price_1SYsu9IUreX0PzJ7KM8Zw1Uj',  // Better monthly $19.99
-    pro_yearly: 'price_1SYsufIUreX0PzJ7XCKOf5hC',   // Better yearly (~$215?) - confirm
-    business_monthly: 'price_1SYsvyIUreX0PzJ7gfKogBNR', // Best monthly $29.99
-    business_yearly: 'price_1SYsvyIUreX0PzJ7Kjfkns1k',  // Best yearly ~$334
+const parsePriceMap = (value, fallback) => {
+    if (!value) return fallback;
+    try {
+        const parsed = JSON.parse(value);
+        return parsed && typeof parsed === 'object' ? parsed : fallback;
+    } catch {
+        return fallback;
+    }
 };
+
+const PRICE_MAP =
+    STRIPE_MODE === 'live'
+        ? parsePriceMap(process.env.PRICE_MAP_LIVE, null)
+        : parsePriceMap(process.env.PRICE_MAP_TEST, null);
+
+if (!PRICE_MAP) {
+    throw new Error('Stripe price map not configured. Set PRICE_MAP_TEST/PRICE_MAP_LIVE JSON in env.');
+}
 
 // Middleware
 app.use(cors());
