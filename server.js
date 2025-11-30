@@ -95,22 +95,13 @@ app.post('/ai/analyze', async (req, res) => {
             .filter(Boolean)
             .join('\n');
 
-        const basePrompt =
-            'You categorize and tag user content. Respond ONLY with JSON containing: ' +
-            'title (7-12 words, specific, rewritten; do not just shorten), ' +
-            'description (2-3 sentences; expand with key entities/keywords for search), ' +
-            'tags (3-8 short keyword strings), suggestedFolders (single-word strings, lowercase or snake_case; ' +
-            'reuse the closest match from provided folders; only create a new one if none clearly fit), ' +
-            'category (one word; the single most specific concept, prefer an existing folder if relevant). ' +
-            'Avoid placeholders. Keep safe for general audiences.';
-
         const userContent = [
             { type: 'text', text: userText || 'Analyze this content.' },
             ...(imageBase64
                 ? [{ type: 'input_image', image_url: `data:image/jpeg;base64,${imageBase64}` }]
                 : []),
         ];
-        console.log('AI analyze prompt to model:', { basePrompt, userContent });
+        console.log('AI analyze prompt to model:', { userContent });
 
         let raw;
 
@@ -121,9 +112,6 @@ app.post('/ai/analyze', async (req, res) => {
                 input: [{ role: 'user', content: userContent }],
                 response_format: { type: 'json_object' },
                 temperature: 0.3,
-                extra_body: {
-                    system: basePrompt,
-                },
             });
             raw =
                 response?.output_text ||
@@ -132,6 +120,15 @@ app.post('/ai/analyze', async (req, res) => {
                 '';
             console.log('AI analyze assistant raw output:', raw);
         } else {
+            const basePrompt =
+                'You categorize and tag user content. Respond ONLY with JSON containing: ' +
+                'title (7-12 words, specific, rewritten; do not just shorten), ' +
+                'description (2-3 sentences; expand with key entities/keywords for search), ' +
+                'tags (3-8 short keyword strings), suggestedFolders (single-word strings, lowercase or snake_case; ' +
+                'reuse the closest match from provided folders; only create a new one if none clearly fit), ' +
+                'category (one word; the single most specific concept, prefer an existing folder if relevant). ' +
+                'Avoid placeholders. Keep safe for general audiences.';
+
             const messages = [
                 {
                     role: 'system',
