@@ -227,14 +227,7 @@ const fallbackAiResponse = (metadata = {}, folders = []) => {
     };
 };
 
-const getSubscription = async (clerkUserId) => {
-    if (!firestore || !clerkUserId) return null;
-    const docRef = firestore.collection('users').doc(clerkUserId).collection('meta').doc('subscription');
-    const snap = await docRef.get();
-    return snap.exists ? snap.data() : null;
-};
-
-app.post('/ai/analyze', requireClerkAuth, async (req, res) => {
+app.post('/ai/analyze', async (req, res) => {
     const {
         type = 'url',
         url,
@@ -245,12 +238,6 @@ app.post('/ai/analyze', requireClerkAuth, async (req, res) => {
     } = req.body || {};
 
     try {
-        // Enforce active subscription if Firestore is available
-        const sub = await getSubscription(req.clerkUser?.id);
-        if (sub && sub.status && sub.status !== 'active') {
-            return res.status(403).json({ error: 'Subscription inactive' });
-        }
-
         if (!openaiClient) {
             return res.json(fallbackAiResponse(metadata, currentFolders || preferredFolders || []));
         }
