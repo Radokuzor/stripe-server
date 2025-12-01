@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
 const OpenAI = require('openai');
-const { verifyToken, clerkClient } = require('@clerk/clerk-sdk-node');
 const admin = require('firebase-admin');
 
 const app = express();
@@ -89,29 +88,22 @@ const extractBearer = (req) => {
     return null;
 };
 
-const requireClerkAuth = async (req, res, next) => {
+const requireFirebaseAuth = async (req, res, next) => {
     try {
         const token = extractBearer(req);
         if (!token) {
             return res.status(401).json({ error: 'Missing Authorization bearer token' });
         }
-        const session = await verifyToken(token, { secretKey: process.env.CLERK_SECRET_KEY });
-        const clerkUserId = session.sub;
-        if (!clerkUserId) {
-            return res.status(401).json({ error: 'Invalid Clerk token' });
-        }
-        const user = await clerkClient.users.getUser(clerkUserId);
-        req.clerkUser = {
-            id: clerkUserId,
-            email: user?.primaryEmailAddress?.emailAddress || user?.emailAddresses?.[0]?.emailAddress,
-            firstName: user?.firstName || '',
-            lastName: user?.lastName || '',
-            imageUrl: user?.imageUrl || '',
-            fullUser: user,
+        const decoded = await admin.auth().verifyIdToken(token);
+        req.user = {
+            uid: decoded.uid,
+            email: decoded.email || null,
+            name: decoded.name || '',
+            picture: decoded.picture || '',
         };
         next();
     } catch (err) {
-        console.error('Clerk auth error:', err);
+        console.error('Firebase auth error:', err);
         return res.status(401).json({ error: 'Unauthorized' });
     }
 };
@@ -125,7 +117,7 @@ const mapPriceIdToPlan = (priceId) => {
 };
 
 const upsertSubscription = async ({
-    clerkUserId,
+    userId,
     priceId,
     status,
     stripeCustomerId,
@@ -136,7 +128,7 @@ const upsertSubscription = async ({
     if (!firestore) return;
     const { planId = null, billingCycle = null } = mapPriceIdToPlan(priceId);
     const planName = planId ? `${planId.charAt(0).toUpperCase()}${planId.slice(1)}` : null;
-    const subRef = firestore.collection('users').doc(clerkUserId).collection('meta').doc('subscription');
+    const subRef = firestore.collection('users').doc(userId).collection('meta').doc('subscription');
     await subRef.set(
         {
             planId,
@@ -170,35 +162,6 @@ app.get('/', (req, res) => {
 
 app.get('/health', (_req, res) => {
     res.json({ ok: true });
-});
-
-app.post('/auth/firebase-token', requireClerkAuth, async (req, res) => {
-    try {
-        if (!admin.apps.length || !firestore) {
-            return res.status(500).json({ error: 'Firebase not configured on server' });
-        }
-        const { id, email, firstName, lastName, imageUrl } = req.clerkUser;
-        const firebaseCustomToken = await admin.auth().createCustomToken(id);
-
-        const userRef = firestore.collection('users').doc(id);
-        await userRef.set(
-            {
-                clerkId: id,
-                email: email || null,
-                firstName: firstName || null,
-                lastName: lastName || null,
-                photoUrl: imageUrl || null,
-                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            },
-            { merge: true }
-        );
-
-        return res.json({ firebaseCustomToken, userId: id });
-    } catch (err) {
-        console.error('Firebase token creation error:', err);
-        return res.status(500).json({ error: 'Failed to create Firebase token' });
-    }
 });
 
 app.get('/plans', (_req, res) => {
@@ -359,26 +322,26 @@ app.post('/ai/analyze', async (req, res) => {
     }
 });
 
-const findOrCreateStripeCustomer = async ({ email, name, clerkUserId }) => {
+const findOrCreateStripeCustomer = async ({ email, name, firebaseUid }) => {
     // Try to find by email
     const existing = await stripe.customers.list({ email, limit: 1 });
     if (existing.data?.length) {
         const customer = existing.data[0];
-        // ensure metadata has clerkUserId
-        if (!customer.metadata?.clerkUserId && clerkUserId) {
-            await stripe.customers.update(customer.id, { metadata: { clerkUserId } });
+        // ensure metadata has firebaseUid
+        if (!customer.metadata?.firebaseUid && firebaseUid) {
+            await stripe.customers.update(customer.id, { metadata: { firebaseUid } });
         }
         return customer.id;
     }
     const created = await stripe.customers.create({
         email,
         name,
-        metadata: { clerkUserId },
+        metadata: { firebaseUid },
     });
     return created.id;
 };
 
-app.post('/create-subscription', requireClerkAuth, async (req, res) => {
+app.post('/create-subscription', requireFirebaseAuth, async (req, res) => {
     try {
         const { planId, billingCycle, metadata = {} } = req.body || {};
         const priceId = PRICE_MAP[`${planId}_${billingCycle}`];
@@ -386,11 +349,11 @@ app.post('/create-subscription', requireClerkAuth, async (req, res) => {
             return res.status(400).json({ error: 'Invalid plan or billing cycle' });
         }
 
-        const email = req.clerkUser?.email;
-        const name = `${req.clerkUser?.firstName || ''} ${req.clerkUser?.lastName || ''}`.trim() || undefined;
-        const clerkUserId = req.clerkUser?.id;
+        const email = req.user?.email;
+        const name = req.user?.name || undefined;
+        const firebaseUid = req.user?.uid;
 
-        const customerId = await findOrCreateStripeCustomer({ email, name, clerkUserId });
+        const customerId = await findOrCreateStripeCustomer({ email, name, firebaseUid });
 
         // Create subscription in incomplete state to use PaymentSheet client secret
         const subscription = await stripe.subscriptions.create({
@@ -398,7 +361,7 @@ app.post('/create-subscription', requireClerkAuth, async (req, res) => {
             items: [{ price: priceId }],
             payment_behavior: 'default_incomplete',
             metadata: {
-                clerkUserId,
+                firebaseUid,
                 planId,
                 billingCycle,
                 ...metadata,
@@ -458,10 +421,10 @@ app.get('/payment-intent/:id', async (req, res) => {
     }
 });
 
-const extractClerkIdFromCustomer = async (customerId) => {
+const extractFirebaseUidFromCustomer = async (customerId) => {
     try {
         const customer = await stripe.customers.retrieve(customerId);
-        return customer?.metadata?.clerkUserId || null;
+        return customer?.metadata?.firebaseUid || null;
     } catch (err) {
         console.error('Failed to retrieve customer', err);
         return null;
@@ -469,19 +432,19 @@ const extractClerkIdFromCustomer = async (customerId) => {
 };
 
 const handleSubscriptionUpdate = async (subscription, explicitStatus) => {
-    const clerkUserId =
-        subscription?.metadata?.clerkUserId ||
+    const firebaseUid =
+        subscription?.metadata?.firebaseUid ||
         subscription?.client_reference_id ||
-        (subscription?.customer ? await extractClerkIdFromCustomer(subscription.customer) : null);
+        (subscription?.customer ? await extractFirebaseUidFromCustomer(subscription.customer) : null);
 
-    if (!clerkUserId) {
-        console.warn('No clerkUserId on subscription update');
+    if (!firebaseUid) {
+        console.warn('No firebaseUid on subscription update');
         return;
     }
 
     const priceId = subscription?.items?.data?.[0]?.price?.id;
     await upsertSubscription({
-        clerkUserId,
+        userId: firebaseUid,
         priceId,
         status: explicitStatus || subscription.status,
         stripeCustomerId: subscription.customer,
@@ -492,13 +455,13 @@ const handleSubscriptionUpdate = async (subscription, explicitStatus) => {
 };
 
 const handleCheckoutCompleted = async (session) => {
-    const clerkUserId =
+    const firebaseUid =
         session.client_reference_id ||
-        session?.metadata?.clerkUserId ||
-        (session?.customer ? await extractClerkIdFromCustomer(session.customer) : null);
+        session?.metadata?.firebaseUid ||
+        (session?.customer ? await extractFirebaseUidFromCustomer(session.customer) : null);
 
-    if (!clerkUserId) {
-        console.warn('No clerkUserId on checkout.session.completed');
+    if (!firebaseUid) {
+        console.warn('No firebaseUid on checkout.session.completed');
         return;
     }
 
