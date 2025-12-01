@@ -543,12 +543,23 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
             case 'checkout.session.completed':
                 await handleCheckoutCompleted(event.data.object);
                 break;
+            case 'customer.subscription.created':
+                await handleSubscriptionUpdate(event.data.object);
+                break;
             case 'customer.subscription.updated':
                 await handleSubscriptionUpdate(event.data.object);
                 break;
             case 'customer.subscription.deleted':
                 await handleSubscriptionUpdate(event.data.object, 'canceled');
                 break;
+            case 'payment_intent.succeeded': {
+                const pi = event.data.object;
+                if (pi.metadata?.subscription) {
+                    const subscription = await stripe.subscriptions.retrieve(pi.metadata.subscription);
+                    await handleSubscriptionUpdate(subscription);
+                }
+                break;
+            }
             case 'invoice.payment_failed': {
                 const invoice = event.data.object;
                 if (invoice.subscription) {
