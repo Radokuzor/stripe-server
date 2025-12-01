@@ -393,7 +393,7 @@ const findOrCreateStripeCustomer = async ({ email, name, clerkUserId }) => {
 
 app.post('/create-subscription', requireClerkAuth, async (req, res) => {
     try {
-        const { planId, billingCycle, successUrl, cancelUrl } = req.body || {};
+        const { planId, billingCycle, metadata = {} } = req.body || {};
         const priceId = PRICE_MAP[`${planId}_${billingCycle}`];
         if (!priceId) {
             return res.status(400).json({ error: 'Invalid plan or billing cycle' });
@@ -405,28 +405,34 @@ app.post('/create-subscription', requireClerkAuth, async (req, res) => {
 
         const customerId = await findOrCreateStripeCustomer({ email, name, clerkUserId });
 
-        const session = await stripe.checkout.sessions.create({
-            mode: 'subscription',
-            client_reference_id: clerkUserId,
+        // Create subscription in incomplete state to use PaymentSheet client secret
+        const subscription = await stripe.subscriptions.create({
             customer: customerId,
-            line_items: [{ price: priceId, quantity: 1 }],
-            success_url: successUrl || 'https://example.com/success',
-            cancel_url: cancelUrl || 'https://example.com/cancel',
-            subscription_data: {
-                metadata: {
-                    clerkUserId,
-                    planId,
-                    billingCycle,
-                },
-            },
+            items: [{ price: priceId }],
+            payment_behavior: 'default_incomplete',
             metadata: {
                 clerkUserId,
                 planId,
                 billingCycle,
+                ...metadata,
             },
+            expand: ['latest_invoice.payment_intent'],
         });
 
-        return res.json({ checkoutUrl: session.url });
+        const paymentIntent = subscription.latest_invoice.payment_intent;
+        const ephemeralKey = await stripe.ephemeralKeys.create(
+            { customer: customerId },
+            { apiVersion: '2024-06-20' }
+        );
+
+        return res.json({
+            subscriptionId: subscription.id,
+            customerId,
+            paymentIntentClientSecret: paymentIntent.client_secret,
+            customerEphemeralKeySecret: ephemeralKey.secret,
+            // alias for backward compatibility
+            ephemeralKeySecret: ephemeralKey.secret,
+        });
     } catch (err) {
         console.error('Create subscription error:', err);
         res.status(500).json({ error: err.message });
