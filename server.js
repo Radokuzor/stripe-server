@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
 const OpenAI = require('openai');
+const { verifyToken, clerkClient } = require('@clerk/clerk-sdk-node');
+const admin = require('firebase-admin');
 
 const app = express();
 const STRIPE_MODE = (process.env.STRIPE_MODE || 'test').toLowerCase();
@@ -17,6 +19,42 @@ const STRIPE_WEBHOOK_SECRET =
 if (!STRIPE_SECRET_KEY) {
     throw new Error('Stripe secret key not configured');
 }
+
+const getFirebaseConfig = () => {
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+        const parsed = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+        if (parsed.private_key) {
+            parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
+        }
+        return parsed;
+    }
+
+    const projectId = process.env.FIREBASE_PROJECT_ID;
+    const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+    const privateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n');
+
+    if (projectId && clientEmail && privateKey) {
+        return {
+            project_id: projectId,
+            client_email: clientEmail,
+            private_key: privateKey,
+        };
+    }
+    return null;
+};
+
+const firebaseConfig = getFirebaseConfig();
+if (!firebaseConfig) {
+    console.warn('Firebase config not fully set. Set FIREBASE_SERVICE_ACCOUNT or FIREBASE_PROJECT_ID/FIREBASE_CLIENT_EMAIL/FIREBASE_PRIVATE_KEY.');
+}
+
+if (firebaseConfig && !admin.apps.length) {
+    admin.initializeApp({
+        credential: admin.credential.cert(firebaseConfig),
+    });
+}
+
+const firestore = admin.apps.length ? admin.firestore() : null;
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
@@ -44,9 +82,86 @@ if (!PRICE_MAP) {
     throw new Error('Stripe price map not configured. Set PRICE_MAP_TEST/PRICE_MAP_LIVE JSON in env.');
 }
 
+const extractBearer = (req) => {
+    const authHeader = req.headers.authorization || '';
+    const [scheme, token] = authHeader.split(' ');
+    if (scheme?.toLowerCase() === 'bearer' && token) return token;
+    return null;
+};
+
+const requireClerkAuth = async (req, res, next) => {
+    try {
+        const token = extractBearer(req);
+        if (!token) {
+            return res.status(401).json({ error: 'Missing Authorization bearer token' });
+        }
+        const session = await verifyToken(token, { secretKey: process.env.CLERK_SECRET_KEY });
+        const clerkUserId = session.sub;
+        if (!clerkUserId) {
+            return res.status(401).json({ error: 'Invalid Clerk token' });
+        }
+        const user = await clerkClient.users.getUser(clerkUserId);
+        req.clerkUser = {
+            id: clerkUserId,
+            email: user?.primaryEmailAddress?.emailAddress || user?.emailAddresses?.[0]?.emailAddress,
+            firstName: user?.firstName || '',
+            lastName: user?.lastName || '',
+            imageUrl: user?.imageUrl || '',
+            fullUser: user,
+        };
+        next();
+    } catch (err) {
+        console.error('Clerk auth error:', err);
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+};
+
+const mapPriceIdToPlan = (priceId) => {
+    const entry = Object.entries(PRICE_MAP).find(([, value]) => value === priceId);
+    if (!entry) return {};
+    const [key] = entry;
+    const [planId, billingCycle] = key.split('_');
+    return { planId, billingCycle };
+};
+
+const upsertSubscription = async ({
+    clerkUserId,
+    priceId,
+    status,
+    stripeCustomerId,
+    stripeSubscriptionId,
+    currentPeriodEnd,
+    cancelAtPeriodEnd,
+}) => {
+    if (!firestore) return;
+    const { planId = null, billingCycle = null } = mapPriceIdToPlan(priceId);
+    const planName = planId ? `${planId.charAt(0).toUpperCase()}${planId.slice(1)}` : null;
+    const subRef = firestore.collection('users').doc(clerkUserId).collection('meta').doc('subscription');
+    await subRef.set(
+        {
+            planId,
+            planName,
+            billingCycle,
+            status: status || null,
+            stripeCustomerId: stripeCustomerId || null,
+            stripeSubscriptionId: stripeSubscriptionId || null,
+            currentPeriodEnd: currentPeriodEnd ? admin.firestore.Timestamp.fromMillis(currentPeriodEnd) : null,
+            cancelAtPeriodEnd: Boolean(cancelAtPeriodEnd),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+    );
+};
+
 // Middleware
 app.use(cors());
-app.use(express.json());
+// Use raw body for Stripe webhooks; JSON for everything else
+app.use((req, res, next) => {
+    if (req.originalUrl === '/stripe/webhook') {
+        return next();
+    }
+    return express.json()(req, res, next);
+});
 
 // Health check endpoint
 app.get('/', (req, res) => {
@@ -55,6 +170,45 @@ app.get('/', (req, res) => {
 
 app.get('/health', (_req, res) => {
     res.json({ ok: true });
+});
+
+app.post('/auth/firebase-token', requireClerkAuth, async (req, res) => {
+    try {
+        if (!admin.apps.length || !firestore) {
+            return res.status(500).json({ error: 'Firebase not configured on server' });
+        }
+        const { id, email, firstName, lastName, imageUrl } = req.clerkUser;
+        const firebaseCustomToken = await admin.auth().createCustomToken(id);
+
+        const userRef = firestore.collection('users').doc(id);
+        await userRef.set(
+            {
+                clerkId: id,
+                email: email || null,
+                firstName: firstName || null,
+                lastName: lastName || null,
+                photoUrl: imageUrl || null,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+        );
+
+        return res.json({ firebaseCustomToken, userId: id });
+    } catch (err) {
+        console.error('Firebase token creation error:', err);
+        return res.status(500).json({ error: 'Failed to create Firebase token' });
+    }
+});
+
+app.get('/plans', (_req, res) => {
+    const plans = Object.keys(PRICE_MAP || {}).reduce((acc, key) => {
+        const [planId, billingCycle] = key.split('_');
+        if (!acc[planId]) acc[planId] = { id: planId, prices: {} };
+        acc[planId].prices[billingCycle] = PRICE_MAP[key];
+        return acc;
+    }, {});
+    res.json({ plans: Object.values(plans) });
 });
 
 const fallbackAiResponse = (metadata = {}, folders = []) => {
@@ -205,61 +359,50 @@ app.post('/ai/analyze', async (req, res) => {
     }
 });
 
-// Create payment intent
-app.post('/create-payment-intent', async (req, res) => {
-    try {
-        const { amount, currency = 'usd', customerId, metadata } = req.body;
-
-        if (!amount) {
-            return res.status(400).json({ error: 'Amount is required' });
+const findOrCreateStripeCustomer = async ({ email, name, clerkUserId }) => {
+    // Try to find by email
+    const existing = await stripe.customers.list({ email, limit: 1 });
+    if (existing.data?.length) {
+        const customer = existing.data[0];
+        // ensure metadata has clerkUserId
+        if (!customer.metadata?.clerkUserId && clerkUserId) {
+            await stripe.customers.update(customer.id, { metadata: { clerkUserId } });
         }
-
-        const paymentIntent = await stripe.paymentIntents.create({
-            amount: Math.round(amount * 100), // Convert to cents
-            currency,
-            customer: customerId,
-            metadata: metadata || {},
-            automatic_payment_methods: {
-                enabled: true,
-            },
-        });
-
-        res.json({
-            clientSecret: paymentIntent.client_secret,
-            paymentIntentId: paymentIntent.id,
-        });
-    } catch (error) {
-        console.error('Error creating payment intent:', error);
-        res.status(500).json({ error: error.message });
+        return customer.id;
     }
-});
+    const created = await stripe.customers.create({
+        email,
+        name,
+        metadata: { clerkUserId },
+    });
+    return created.id;
+};
 
-app.post('/create-subscription', async (req, res) => {
+app.post('/create-subscription', requireClerkAuth, async (req, res) => {
     try {
-        const { email, name, planId, billingCycle } = req.body;
-
-        if (!email) {
-            return res.status(400).json({ error: 'Email required' });
-        }
-
+        const { planId, billingCycle, metadata = {} } = req.body || {};
         const priceId = PRICE_MAP[`${planId}_${billingCycle}`];
         if (!priceId) {
-            return res.status(400).json({ error: 'Invalid plan' });
+            return res.status(400).json({ error: 'Invalid plan or billing cycle' });
         }
 
-        let customerId;
-        const existing = await stripe.customers.list({ email, limit: 1 });
-        if (existing.data.length) {
-            customerId = existing.data[0].id;
-        } else {
-            const customer = await stripe.customers.create({ email, name });
-            customerId = customer.id;
-        }
+        const email = req.clerkUser?.email;
+        const name = `${req.clerkUser?.firstName || ''} ${req.clerkUser?.lastName || ''}`.trim() || undefined;
+        const clerkUserId = req.clerkUser?.id;
 
+        const customerId = await findOrCreateStripeCustomer({ email, name, clerkUserId });
+
+        // Create subscription in incomplete state to use PaymentSheet client secret
         const subscription = await stripe.subscriptions.create({
             customer: customerId,
             items: [{ price: priceId }],
             payment_behavior: 'default_incomplete',
+            metadata: {
+                clerkUserId,
+                planId,
+                billingCycle,
+                ...metadata,
+            },
             expand: ['latest_invoice.payment_intent'],
         });
 
@@ -273,6 +416,8 @@ app.post('/create-subscription', async (req, res) => {
             subscriptionId: subscription.id,
             customerId,
             paymentIntentClientSecret: paymentIntent.client_secret,
+            customerEphemeralKeySecret: ephemeralKey.secret,
+            // alias for backward compatibility
             ephemeralKeySecret: ephemeralKey.secret,
         });
     } catch (err) {
@@ -313,8 +458,59 @@ app.get('/payment-intent/:id', async (req, res) => {
     }
 });
 
+const extractClerkIdFromCustomer = async (customerId) => {
+    try {
+        const customer = await stripe.customers.retrieve(customerId);
+        return customer?.metadata?.clerkUserId || null;
+    } catch (err) {
+        console.error('Failed to retrieve customer', err);
+        return null;
+    }
+};
+
+const handleSubscriptionUpdate = async (subscription, explicitStatus) => {
+    const clerkUserId =
+        subscription?.metadata?.clerkUserId ||
+        subscription?.client_reference_id ||
+        (subscription?.customer ? await extractClerkIdFromCustomer(subscription.customer) : null);
+
+    if (!clerkUserId) {
+        console.warn('No clerkUserId on subscription update');
+        return;
+    }
+
+    const priceId = subscription?.items?.data?.[0]?.price?.id;
+    await upsertSubscription({
+        clerkUserId,
+        priceId,
+        status: explicitStatus || subscription.status,
+        stripeCustomerId: subscription.customer,
+        stripeSubscriptionId: subscription.id,
+        currentPeriodEnd: subscription.current_period_end ? subscription.current_period_end * 1000 : null,
+        cancelAtPeriodEnd: subscription.cancel_at_period_end,
+    });
+};
+
+const handleCheckoutCompleted = async (session) => {
+    const clerkUserId =
+        session.client_reference_id ||
+        session?.metadata?.clerkUserId ||
+        (session?.customer ? await extractClerkIdFromCustomer(session.customer) : null);
+
+    if (!clerkUserId) {
+        console.warn('No clerkUserId on checkout.session.completed');
+        return;
+    }
+
+    // Retrieve subscription to get price id and period end
+    if (session.subscription) {
+        const subscription = await stripe.subscriptions.retrieve(session.subscription);
+        await handleSubscriptionUpdate(subscription);
+    }
+};
+
 // Webhook endpoint for Stripe events
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const sig = req.headers['stripe-signature'];
     let event;
 
@@ -329,20 +525,42 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
-    // Handle the event
-    switch (event.type) {
-        case 'payment_intent.succeeded':
-            const paymentIntent = event.data.object;
-            console.log('PaymentIntent succeeded:', paymentIntent.id);
-            // Add your business logic here
-            break;
-        case 'payment_intent.payment_failed':
-            const failedPayment = event.data.object;
-            console.log('Payment failed:', failedPayment.id);
-            // Add your business logic here
-            break;
-        default:
-            console.log(`Unhandled event type ${event.type}`);
+    try {
+        switch (event.type) {
+            case 'checkout.session.completed':
+                await handleCheckoutCompleted(event.data.object);
+                break;
+            case 'customer.subscription.created':
+                await handleSubscriptionUpdate(event.data.object);
+                break;
+            case 'customer.subscription.updated':
+                await handleSubscriptionUpdate(event.data.object);
+                break;
+            case 'customer.subscription.deleted':
+                await handleSubscriptionUpdate(event.data.object, 'canceled');
+                break;
+            case 'payment_intent.succeeded': {
+                const pi = event.data.object;
+                if (pi.metadata?.subscription) {
+                    const subscription = await stripe.subscriptions.retrieve(pi.metadata.subscription);
+                    await handleSubscriptionUpdate(subscription);
+                }
+                break;
+            }
+            case 'invoice.payment_failed': {
+                const invoice = event.data.object;
+                if (invoice.subscription) {
+                    const subscription = await stripe.subscriptions.retrieve(invoice.subscription);
+                    await handleSubscriptionUpdate(subscription, 'past_due');
+                }
+                break;
+            }
+            default:
+                console.log(`Unhandled event type ${event.type}`);
+        }
+    } catch (err) {
+        console.error('Webhook processing error:', err);
+        return res.status(500).send('Webhook handler error');
     }
 
     res.json({ received: true });
