@@ -155,7 +155,13 @@ const upsertSubscription = async ({
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+// Use raw body for Stripe webhooks; JSON for everything else
+app.use((req, res, next) => {
+    if (req.originalUrl === '/stripe/webhook') {
+        return next();
+    }
+    return express.json()(req, res, next);
+});
 
 // Health check endpoint
 app.get('/', (req, res) => {
@@ -403,7 +409,6 @@ app.post('/create-subscription', requireClerkAuth, async (req, res) => {
             mode: 'subscription',
             client_reference_id: clerkUserId,
             customer: customerId,
-            customer_email: email,
             line_items: [{ price: priceId, quantity: 1 }],
             success_url: successUrl || 'https://example.com/success',
             cancel_url: cancelUrl || 'https://example.com/cancel',
