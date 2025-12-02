@@ -101,6 +101,11 @@ const requireFirebaseAuth = async (req, res, next) => {
             name: decoded.name || '',
             picture: decoded.picture || '',
         };
+        try {
+            await ensurePromoProSubscription(decoded.uid);
+        } catch (promoErr) {
+            console.error('ensurePromoProSubscription error:', promoErr);
+        }
         next();
     } catch (err) {
         console.error('Firebase auth error:', err);
@@ -139,6 +144,35 @@ const upsertSubscription = async ({
             stripeSubscriptionId: stripeSubscriptionId || null,
             currentPeriodEnd: currentPeriodEnd ? admin.firestore.Timestamp.fromMillis(currentPeriodEnd) : null,
             cancelAtPeriodEnd: Boolean(cancelAtPeriodEnd),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+    );
+};
+
+const ensurePromoProSubscription = async (userId) => {
+    if (!firestore || !userId) return;
+    const subRef = firestore.collection('users').doc(userId).collection('meta').doc('subscription');
+    const snap = await subRef.get();
+    const existing = snap.exists ? snap.data() : null;
+
+    // If they already have a Stripe-backed sub, leave it alone
+    if (existing?.stripeSubscriptionId || existing?.stripeCustomerId) return;
+    // If already marked promo pro and active, leave it
+    if (existing?.planId === 'pro' && existing?.status === 'active' && existing?.promoUnlock === true) return;
+
+    await subRef.set(
+        {
+            planId: 'pro',
+            planName: 'Pro',
+            billingCycle: existing?.billingCycle || 'monthly',
+            status: 'active',
+            stripeCustomerId: existing?.stripeCustomerId || null,
+            stripeSubscriptionId: existing?.stripeSubscriptionId || null,
+            currentPeriodEnd: existing?.currentPeriodEnd || null,
+            cancelAtPeriodEnd: false,
+            promoUnlock: true,
+            promoGrantedAt: admin.firestore.FieldValue.serverTimestamp(),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         },
         { merge: true }
