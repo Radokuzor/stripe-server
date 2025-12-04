@@ -198,6 +198,58 @@ app.get('/health', (_req, res) => {
     res.json({ ok: true });
 });
 
+// TikTok video download proxy via RapidAPI
+app.post('/video/download', async (req, res) => {
+    try {
+        const { url } = req.body || {};
+        if (!url) {
+            return res.status(400).json({ error: 'Missing video URL' });
+        }
+
+        const apiHost = process.env.RAPIDAPI_HOST;
+        const apiKey = process.env.RAPIDAPI_KEY;
+        if (!apiHost || !apiKey) {
+            console.error('RapidAPI host/key not configured.');
+            return res.status(500).json({ error: 'Video download service unavailable' });
+        }
+
+        const endpoint = `https://${apiHost}/v1/tiktok?url=${encodeURIComponent(url)}`;
+
+        const response = await fetch(endpoint, {
+            method: 'GET',
+            headers: {
+                'x-rapidapi-host': apiHost,
+                'x-rapidapi-key': apiKey,
+            },
+        });
+
+        if (!response.ok) {
+            const text = await response.text();
+            console.error('RapidAPI TikTok error:', response.status, text);
+            return res.status(502).json({ error: 'Failed to download video' });
+        }
+
+        const data = await response.json();
+        const mp4 = data?.data?.play?.url;
+        const thumbnail = data?.data?.cover || null;
+        const title = data?.data?.title || '';
+
+        if (!mp4) {
+            return res.status(500).json({ error: 'Failed to extract video' });
+        }
+
+        res.json({
+            mp4,
+            thumbnail,
+            title,
+            source: 'tiktok',
+        });
+    } catch (err) {
+        console.error('TikTok download error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
 app.get('/plans', (_req, res) => {
     const plans = Object.keys(PRICE_MAP || {}).reduce((acc, key) => {
         const [planId, billingCycle] = key.split('_');
