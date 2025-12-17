@@ -198,6 +198,17 @@ app.get('/health', (_req, res) => {
     res.json({ ok: true });
 });
 
+// Client config for version gating
+const IOS_MIN_VERSION = process.env.IOS_MIN_VERSION || '1.2.0';
+const ANDROID_MIN_VERSION = process.env.ANDROID_MIN_VERSION || '1.2.0';
+
+app.get('/config', (_req, res) => {
+    res.json({
+        ios: { minVersion: IOS_MIN_VERSION },
+        android: { minVersion: ANDROID_MIN_VERSION },
+    });
+});
+
 // TikTok video download proxy via RapidAPI
 app.post('/video/download', async (req, res) => {
     try {
