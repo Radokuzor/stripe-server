@@ -209,6 +209,68 @@ app.get('/config', (_req, res) => {
     });
 });
 
+const parseBooleanish = (value) => {
+    if (value === true || value === false) return value;
+    if (typeof value !== 'string') return null;
+    const normalized = value.trim().toLowerCase();
+    if (['true', '1', 'yes', 'y'].includes(normalized)) return true;
+    if (['false', '0', 'no', 'n'].includes(normalized)) return false;
+    return null;
+};
+
+const extractYouTubeVideoId = (input) => {
+    if (!input || typeof input !== 'string') return null;
+    const trimmed = input.trim();
+    if (!trimmed) return null;
+
+    if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) return trimmed;
+
+    try {
+        const url = new URL(trimmed);
+        const v = url.searchParams.get('v');
+        if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) return v;
+
+        const parts = url.pathname.split('/').filter(Boolean);
+        const candidate = parts[0] === 'shorts' || parts[0] === 'embed' ? parts[1] : parts[0];
+        if (candidate && /^[a-zA-Z0-9_-]{11}$/.test(candidate)) return candidate;
+    } catch {
+        // Not a URL
+    }
+
+    return null;
+};
+
+const chooseBestBy = (items, scoreFn) => {
+    if (!Array.isArray(items) || !items.length) return null;
+    let best = null;
+    let bestScore = -Infinity;
+    for (const item of items) {
+        const score = scoreFn(item);
+        if (typeof score !== 'number' || Number.isNaN(score)) continue;
+        if (score > bestScore) {
+            bestScore = score;
+            best = item;
+        }
+    }
+    return best;
+};
+
+const getYoutubeRapidApiConfig = () => {
+    const host = process.env.RAPIDAPI_YOUTUBE_HOST || null;
+    const key = process.env.RAPIDAPI_KEY || null;
+    const path = process.env.RAPIDAPI_YOUTUBE_PATH || '/v2/video/details';
+    const requireAuth = (process.env.YOUTUBE_DOWNLOAD_REQUIRE_AUTH || '').toLowerCase() === 'true';
+    const timeoutMs = Number(process.env.RAPIDAPI_YOUTUBE_TIMEOUT_MS || 15000);
+
+    return {
+        host,
+        key,
+        path: path.startsWith('/') ? path : `/${path}`,
+        requireAuth,
+        timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : 15000,
+    };
+};
+
 // TikTok video download proxy via RapidAPI
 app.post('/video/download', async (req, res) => {
     try {
@@ -260,6 +322,192 @@ app.post('/video/download', async (req, res) => {
         res.status(500).json({ error: 'Server error' });
     }
 });
+
+const youtubeDownloadHandler = async (req, res) => {
+    try {
+        const { host, key, path, requireAuth, timeoutMs } = getYoutubeRapidApiConfig();
+
+        if (requireAuth) {
+            if (!firebaseConfig || !admin.apps.length) {
+                return res.status(500).json({ error: 'Auth required but Firebase not configured' });
+            }
+            let nextCalled = false;
+            await requireFirebaseAuth(req, res, () => {
+                nextCalled = true;
+            });
+            if (!nextCalled) return;
+        }
+
+        const payload = {
+            ...(req.query || {}),
+            ...(req.body || {}),
+        };
+
+        const {
+            videoId: incomingVideoId,
+            url: incomingUrl,
+            urlAccess = 'normal',
+            lang,
+            videos = 'auto',
+            audios = 'auto',
+            includeRaw,
+        } = payload;
+
+        const videoId = extractYouTubeVideoId(incomingVideoId || incomingUrl);
+        if (!videoId) {
+            return res.status(400).json({ error: 'Missing or invalid videoId (or url)' });
+        }
+
+        if (!host || !key) {
+            console.error('RapidAPI YouTube host/key not configured.');
+            return res.status(500).json({ error: 'YouTube download service unavailable' });
+        }
+
+        const qs = new URLSearchParams();
+        qs.set('videoId', videoId);
+        if (urlAccess) qs.set('urlAccess', urlAccess);
+        if (lang) qs.set('lang', lang);
+        if (videos) qs.set('videos', videos);
+        if (audios) qs.set('audios', audios);
+
+        const requestPaths = [
+            path,
+            '/v2/video/details',
+            '/video/details',
+            '/v2/video',
+            '/video',
+        ].filter((p, idx, arr) => typeof p === 'string' && p.startsWith('/') && arr.indexOf(p) === idx);
+
+        const fetchAttempt = async (tryPath) => {
+            const endpoint = `https://${host}${tryPath}?${qs.toString()}`;
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const response = await fetch(endpoint, {
+                    method: 'GET',
+                    headers: {
+                        'x-rapidapi-host': host,
+                        'x-rapidapi-key': key,
+                    },
+                    signal: controller.signal,
+                });
+
+                const text = await response.text();
+                let data;
+                try {
+                    data = text ? JSON.parse(text) : null;
+                } catch {
+                    data = null;
+                }
+
+                return { response, text, data, endpoint };
+            } finally {
+                clearTimeout(timeout);
+            }
+        };
+
+        let lastAttempt = null;
+        for (const tryPath of requestPaths) {
+            lastAttempt = await fetchAttempt(tryPath);
+            if (lastAttempt.response.ok) break;
+
+            const message = lastAttempt.data?.message || lastAttempt.data?.error || '';
+            const isMissingEndpoint =
+                lastAttempt.response.status === 404 &&
+                typeof message === 'string' &&
+                message.toLowerCase().includes('does not exist');
+
+            if (!isMissingEndpoint) break;
+        }
+
+        const response = lastAttempt?.response;
+        const text = lastAttempt?.text;
+        const data = lastAttempt?.data;
+        const endpoint = lastAttempt?.endpoint;
+
+        if (!response?.ok) {
+            console.error('RapidAPI YouTube error:', response?.status, endpoint, text?.slice?.(0, 500) || text);
+            const message = data?.message || data?.error || 'Failed to fetch YouTube download data';
+            return res.status(502).json({ error: message, status: response?.status || 502 });
+        }
+
+        const thumbnails = Array.isArray(data?.thumbnails) ? data.thumbnails : [];
+        const bestThumbnail = chooseBestBy(thumbnails, (t) => (t?.width || 0) * (t?.height || 0));
+
+        const videosItems = Array.isArray(data?.videos?.items) ? data.videos.items : [];
+        const audiosItems = Array.isArray(data?.audios?.items) ? data.audios.items : [];
+
+        const normalizedVideos = videosItems.map((v) => ({
+            url: v?.url || null,
+            quality: v?.quality || null,
+            width: typeof v?.width === 'number' && Number.isFinite(v.width) ? v.width : null,
+            height: typeof v?.height === 'number' && Number.isFinite(v.height) ? v.height : null,
+            hasAudio: v?.hasAudio === true,
+            extension: v?.extension || null,
+            mimeType: v?.mimeType || null,
+            size: typeof v?.size === 'number' && Number.isFinite(v.size) ? v.size : null,
+            sizeText: v?.sizeText || null,
+            lengthMs: typeof v?.lengthMs === 'number' && Number.isFinite(v.lengthMs) ? v.lengthMs : null,
+        }));
+
+        const normalizedAudios = audiosItems.map((a) => ({
+            url: a?.url || null,
+            extension: a?.extension || null,
+            mimeType: a?.mimeType || null,
+            size: typeof a?.size === 'number' && Number.isFinite(a.size) ? a.size : null,
+            sizeText: a?.sizeText || null,
+            lengthMs: typeof a?.lengthMs === 'number' && Number.isFinite(a.lengthMs) ? a.lengthMs : null,
+            isDrc: a?.isDrc === true,
+        }));
+
+        const bestVideoWithAudio = chooseBestBy(
+            normalizedVideos.filter((v) => v?.url && v?.hasAudio),
+            (v) => (v?.height || 0) * 1_000_000 + (v?.width || 0)
+        );
+
+        const bestAudio = chooseBestBy(
+            normalizedAudios.filter((a) => a?.url),
+            (a) => a?.size || 0
+        );
+
+        const includeRawBool = parseBooleanish(includeRaw);
+
+        return res.json({
+            source: 'youtube',
+            id: data?.id || videoId,
+            title: data?.title || '',
+            description: data?.description || '',
+            channel: data?.channel
+                ? {
+                    id: data.channel?.id || null,
+                    name: data.channel?.name || '',
+                    handle: data.channel?.handle || '',
+                    avatar: Array.isArray(data.channel?.avatar) ? data.channel.avatar : [],
+                }
+                : null,
+            lengthSeconds: data?.lengthSeconds ? Number(data.lengthSeconds) : null,
+            thumbnails,
+            thumbnail: bestThumbnail?.url || null,
+            recommended: {
+                videoWithAudio: bestVideoWithAudio,
+                audio: bestAudio,
+            },
+            videos: normalizedVideos,
+            audios: normalizedAudios,
+            raw: includeRawBool ? data : undefined,
+        });
+    } catch (err) {
+        const aborted = err?.name === 'AbortError';
+        console.error('YouTube download error:', err);
+        return res
+            .status(aborted ? 504 : 500)
+            .json({ error: aborted ? 'YouTube download timed out' : 'Server error' });
+    }
+};
+
+// YouTube download data proxy via RapidAPI (youtube-media-downloader)
+app.get('/youtube/download', youtubeDownloadHandler);
+app.post('/youtube/download', youtubeDownloadHandler);
 
 app.get('/plans', (_req, res) => {
     const plans = Object.keys(PRICE_MAP || {}).reduce((acc, key) => {
