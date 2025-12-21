@@ -338,6 +338,32 @@ const getTikTokRapidApiConfig = () => {
     };
 };
 
+const getInstagramRapidApiConfig = () => {
+    const host = process.env.RAPIDAPI_INSTAGRAM_HOST || 'instagram-reels-downloader-api.p.rapidapi.com';
+    const key = process.env.RAPIDAPI_KEY || null;
+    const path = process.env.RAPIDAPI_INSTAGRAM_PATH || '/download';
+    const timeoutMs = Number(process.env.RAPIDAPI_INSTAGRAM_TIMEOUT_MS || 15000);
+
+    return {
+        host,
+        key,
+        path: path.startsWith('/') ? path : `/${path}`,
+        timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : 15000,
+    };
+};
+
+const parseResolution = (value) => {
+    if (!value || typeof value !== 'string') return { width: null, height: null };
+    const match = value.match(/(\d+)\s*x\s*(\d+)/i);
+    if (!match) return { width: null, height: null };
+    const width = Number(match[1]);
+    const height = Number(match[2]);
+    return {
+        width: Number.isFinite(width) ? width : null,
+        height: Number.isFinite(height) ? height : null,
+    };
+};
+
 const fetchTikTokDownload = async (url) => {
     if (!url) throw createHttpError(400, 'Missing video URL');
 
@@ -379,6 +405,84 @@ const fetchTikTokDownload = async (url) => {
     }
 
     return { mp4, thumbnail, title };
+};
+
+const fetchInstagramDownload = async (url) => {
+    if (!url) throw createHttpError(400, 'Missing url');
+
+    const { host, key, path, timeoutMs } = getInstagramRapidApiConfig();
+    if (!host || !key) {
+        console.error('RapidAPI Instagram host/key not configured.');
+        throw createHttpError(500, 'Instagram download service unavailable');
+    }
+
+    const endpoint = `https://${host}${path}?url=${encodeURIComponent(url)}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    const response = await fetch(endpoint, {
+        method: 'GET',
+        headers: {
+            'x-rapidapi-host': host,
+            'x-rapidapi-key': key,
+        },
+        signal: controller.signal,
+    }).finally(() => clearTimeout(timeout));
+
+    const text = await response.text();
+    let payload;
+    try {
+        payload = text ? JSON.parse(text) : null;
+    } catch {
+        payload = null;
+    }
+
+    if (!response.ok) {
+        console.error('RapidAPI Instagram error:', response.status, text?.slice?.(0, 500) || text);
+        const message = payload?.message || payload?.error || 'Failed to fetch Instagram download data';
+        throw createHttpError(502, message, { status: response.status });
+    }
+
+    if (payload?.success === false) {
+        throw createHttpError(502, payload?.message || 'Failed to fetch Instagram download data');
+    }
+
+    const data = payload?.data || null;
+    const medias = Array.isArray(data?.medias) ? data.medias : [];
+
+    const videoCandidates = medias
+        .filter((m) => (m?.type || '').toLowerCase() === 'video' && m?.url)
+        .map((m) => {
+            const { width, height } = parseResolution(m?.resolution || m?.quality || '');
+            return {
+                url: m.url,
+                width,
+                height,
+                extension: m?.extension || null,
+                duration: typeof m?.duration === 'number' && Number.isFinite(m.duration) ? m.duration : null,
+            };
+        });
+
+    const imageCandidates = medias
+        .filter((m) => (m?.type || '').toLowerCase() === 'image' && m?.url)
+        .map((m) => ({
+            url: m.url,
+            extension: m?.extension || null,
+        }));
+
+    const bestVideo = chooseBestBy(videoCandidates, (v) => (v?.height || 0) * 1_000_000 + (v?.width || 0));
+    const bestImage = imageCandidates.length ? imageCandidates[0] : null;
+
+    if (!bestVideo && !bestImage) {
+        throw createHttpError(502, 'No downloadable media URL');
+    }
+
+    return {
+        assetUrl: bestVideo?.url || bestImage?.url,
+        mediaType: bestVideo ? 'video' : 'image',
+        title: data?.title || '',
+        thumbnail: data?.thumbnail || null,
+    };
 };
 
 // TikTok video download proxy via RapidAPI
@@ -605,6 +709,7 @@ app.post('/download/resolve', async (req, res) => {
         // Allowlist supported hosts to avoid using this as a generic proxy.
         const isYouTube = isHost(url, (h) => h === 'youtu.be' || h.endsWith('youtube.com'));
         const isTikTok = isHost(url, (h) => h.endsWith('tiktok.com') || h.endsWith('tiktokcdn.com') || h.endsWith('tiktokv.com'));
+        const isInstagram = isHost(url, (h) => h === 'instagr.am' || h.endsWith('instagram.com'));
 
         if (isYouTube) {
             const data = await fetchYoutubeDownloadData({ url }, req);
@@ -628,6 +733,17 @@ app.post('/download/resolve', async (req, res) => {
                 provider: 'tiktok',
                 mediaType: 'video',
                 assetUrl: data.mp4,
+                thumbnail: data.thumbnail || null,
+                title: data.title || '',
+            });
+        }
+
+        if (isInstagram) {
+            const data = await fetchInstagramDownload(url);
+            return res.json({
+                provider: 'instagram',
+                mediaType: data.mediaType,
+                assetUrl: data.assetUrl,
                 thumbnail: data.thumbnail || null,
                 title: data.title || '',
             });
