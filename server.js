@@ -306,7 +306,7 @@ const verifyFirebaseAuthForRequest = async (req) => {
 };
 
 const getYoutubeRapidApiConfig = () => {
-    const host = process.env.RAPIDAPI_YOUTUBE_HOST || null;
+    const host = process.env.RAPIDAPI_YOUTUBE_HOST || 'youtube-media-downloader.p.rapidapi.com';
     const key = process.env.RAPIDAPI_KEY || null;
     const path = process.env.RAPIDAPI_YOUTUBE_PATH || '/v2/video/details';
     const requireAuth = (process.env.YOUTUBE_DOWNLOAD_REQUIRE_AUTH || '').toLowerCase() === 'true';
@@ -321,25 +321,44 @@ const getYoutubeRapidApiConfig = () => {
     };
 };
 
+const getTikTokRapidApiConfig = () => {
+    const host =
+        process.env.RAPIDAPI_TIKTOK_HOST ||
+        process.env.RAPIDAPI_HOST ||
+        'tiktok-downloader-download-tiktok-videos-without-watermark.p.rapidapi.com';
+    const key = process.env.RAPIDAPI_KEY || null;
+    const path = process.env.RAPIDAPI_TIKTOK_PATH || '/rich_response/index';
+    const timeoutMs = Number(process.env.RAPIDAPI_TIKTOK_TIMEOUT_MS || 15000);
+
+    return {
+        host,
+        key,
+        path: path.startsWith('/') ? path : `/${path}`,
+        timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : 15000,
+    };
+};
+
 const fetchTikTokDownload = async (url) => {
     if (!url) throw createHttpError(400, 'Missing video URL');
 
-    const apiHost = process.env.RAPIDAPI_HOST;
-    const apiKey = process.env.RAPIDAPI_KEY;
-    if (!apiHost || !apiKey) {
+    const { host, key, path, timeoutMs } = getTikTokRapidApiConfig();
+    if (!host || !key) {
         console.error('RapidAPI host/key not configured.');
         throw createHttpError(500, 'Video download service unavailable');
     }
 
-    const endpoint = `https://${apiHost}/v1/tiktok?url=${encodeURIComponent(url)}`;
+    const endpoint = `https://${host}${path}?url=${encodeURIComponent(url)}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     const response = await fetch(endpoint, {
         method: 'GET',
         headers: {
-            'x-rapidapi-host': apiHost,
-            'x-rapidapi-key': apiKey,
+            'x-rapidapi-host': host,
+            'x-rapidapi-key': key,
         },
-    });
+        signal: controller.signal,
+    }).finally(() => clearTimeout(timeout));
 
     if (!response.ok) {
         const text = await response.text();
@@ -348,9 +367,12 @@ const fetchTikTokDownload = async (url) => {
     }
 
     const data = await response.json();
-    const mp4 = data?.data?.play?.url;
-    const thumbnail = data?.data?.cover || null;
-    const title = data?.data?.title || '';
+    const mp4 = Array.isArray(data?.video) ? data.video[0] : data?.video || null;
+    const thumbnail =
+        (Array.isArray(data?.cover) ? data.cover[0] : data?.cover) ||
+        (Array.isArray(data?.dynamic_cover) ? data.dynamic_cover[0] : data?.dynamic_cover) ||
+        null;
+    const title = (Array.isArray(data?.description) ? data.description[0] : data?.description) || '';
 
     if (!mp4) {
         throw createHttpError(502, 'Failed to extract video');
